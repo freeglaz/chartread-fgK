@@ -1,0 +1,5 @@
+# build outputs (build-chartread-fgK.sh --out, make-source-tarball.sh)
+/out/
+/_out/
+/dist/
+__pycache__/

@@ -1,0 +1,407 @@
+--- a/spectro/chartread.c
++++ b/spectro/chartread.c
+@@ -12,6 +12,12 @@
+  *
+  * This material is licenced under the GNU AFFERO GENERAL PUBLIC LICENSE Version 3 :-
+  * see the License.txt file for licencing details.
++ *
++ * MODIFIED VERSION (GNU AGPL v3, section 5a): changed by the freeglaz contributors,
++ * 2026-11-22 to 2026-11-23, "chartread-fgK" checkpoint patch v3.1: new -K option, the .ti3
++ * is rewritten after each strip pass through a temporary file that is flushed, renamed and
++ * its directory flushed; refused, reduced and not durable saves are reported. Search for
++ * "freeglaz" below. This is not the official ArgyllCMS chartread.
+  */
+ 
+ /* This program reads a reflective or transmissive print target chart */
+@@ -119,6 +125,11 @@
+ 
+ #if defined (NT)
+ #include <conio.h>
++#include <windows.h>
++#else
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
+ #endif
+ 
+ 
+@@ -220,7 +231,171 @@
+ }
+ 
+ 
++/* -K checkpoint support (freeglaz patch).                                   */
++/* The .ti3 is rewritten after every accepted strip pass, through a temporary */
++/* file that is flushed to disk and then renamed over the real name, so that  */
++/* an interruption leaves either the previous or the new complete file, and   */
++/* -r can resume from it. save_ti3() is made safe to call repeatedly.         */
++
++/* Replace or append a keyword in the first table */
++static void ckpt_set_kword(cgats *ocg, char *ksym, char *kdata) {
++	ocg->add_kword_at(ocg, 0, ocg->find_kword(ocg, 0, ksym), ksym, kdata, NULL);
++}
++
++/* Free all the sets of the first table so that it can be refilled */
++static void ckpt_clear_sets(cgats *ocg) {
++	cgats_table *t = &ocg->t[0];
++	int k, i;
++
++	for (k = 0; k < t->nsets; k++) {
++		for (i = 0; i < t->nfields; i++)
++			ocg->al->free(ocg->al, t->fdata[k][i]);
++		ocg->al->free(ocg->al, t->fdata[k]);
++	}
++	t->nsets = 0;
++}
++
++#if !defined(NT)
++#ifdef F_FULLFSYNC
++/* nz if errno e from F_FULLFSYNC means "not supported here" (and nothing worse). */
++/* EOPNOTSUPP is distinct from ENOTSUP on macOS (102 vs 45) but equal on Linux.   */
++static int ckpt_fullfsync_unsupported(int e) {
++	if (e == ENOTSUP || e == EINVAL)
++		return 1;
++#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
++	if (e == EOPNOTSUPP)
++		return 1;
++#endif
++	return 0;
++}
++#endif
++
++/* Flush an open file or directory to stable storage.                          */
++/* fsync() always; then, where it exists (macOS), F_FULLFSYNC, since fsync()     */
++/* there does not flush the drive cache.                                         */
++/* Return 0 when fully flushed, 1 when fsync() succeeded but F_FULLFSYNC is not  */
++/* supported here (ENOTSUP, EOPNOTSUPP or EINVAL: a REDUCED guarantee that the   */
++/* caller must report), -1 on any other error (errno set).                       */
++static int ckpt_flush_fd(int fd) {
++	if (fsync(fd) != 0)
++		return -1;
++#ifdef F_FULLFSYNC
++	if (fcntl(fd, F_FULLFSYNC) == -1) {
++		if (ckpt_fullfsync_unsupported(errno))
++			return 1;
++		return -1;
++	}
++#endif
++	return 0;
++}
++#endif
++
++/* Durability of a write that succeeded (ckpt_write_atomic() *durab) */
++#define CKPT_DURABLE   0	/* file and directory fully flushed */
++#define CKPT_REDUCED   1	/* F_FULLFSYNC not supported: fsync() only (wmsg says where) */
++#define CKPT_NODIRSYNC 2	/* renamed, but the directory flush failed (wmsg) */
++
++/* Write ocg to outname through outname.tmp, flush, rename, flush the directory. */
++/* Return 0 if outname now holds the new data (*durab and wmsg tell how durably), */
++/* nz on error with a message in emsg (outname is then unchanged).               */
++static int ckpt_write_atomic(cgats *ocg, char *outname, char *emsg, size_t emsgl,
++                             char *wmsg, size_t wmsgl, int *durab) {
++	char tmpname[MAXNAMEL+20];
++	cgatsFile *fp;
++	int rv;
++
++	*durab = CKPT_DURABLE;
++	wmsg[0] = '\000';
++	snprintf(tmpname, sizeof(tmpname), "%s.tmp", outname);
++	/* (Not ocg->write_name(): it ignores the result of the final fclose(), */
++	/*  so a disk full on the last buffer flush would go unnoticed) */
++	if ((fp = new_cgatsFileStd_name(tmpname, "w")) == NULL) {
++		snprintf(emsg, emsgl, "unable to open '%s' for writing", tmpname);
++		return 1;
++	}
++	if ((rv = ocg->write(ocg, fp)) != 0)
++		snprintf(emsg, emsgl, "%s", ocg->e.m);
++	if (fp->del(fp) != 0 && rv == 0) {
++		rv = 1;
++		snprintf(emsg, emsgl, "write error on '%s' (%s)", tmpname, strerror(errno));
++	}
++	if (rv != 0) {
++		remove(tmpname);
++		return 1;
++	}
++#if defined(NT)
++	if (!MoveFileExA(tmpname, outname, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++		snprintf(emsg, emsgl, "replacing '%s' failed (error %lu), readings are in '%s'",
++		         outname, (unsigned long)GetLastError(), tmpname);
++		return 1;
++	}
++#else
++	{
++		int fd, fr = -1, dr = -1, e;
++		char dname[MAXNAMEL+20], *sl;
++
++		if ((fd = open(tmpname, O_RDONLY)) < 0 || (fr = ckpt_flush_fd(fd)) < 0) {
++			e = errno;
++			snprintf(emsg, emsgl, "flushing '%s' failed (%s)", tmpname, strerror(e));
++			if (fd >= 0)
++				close(fd);
++			remove(tmpname);
++			return 1;
++		}
++		close(fd);
++		if (rename(tmpname, outname) != 0) {
++			snprintf(emsg, emsgl, "renaming '%s' failed (%s), readings are in '%s'",
++			         outname, strerror(errno), tmpname);
++			return 1;
++		}
++		/* Make the rename itself durable */
++		strcpy(dname, outname);
++		if ((sl = strrchr(dname, '/')) == NULL)
++			strcpy(dname, ".");
++		else if (sl == dname)
++			dname[1] = '\000';		/* file in "/" */
++		else
++			*sl = '\000';
++		if ((fd = open(dname, O_RDONLY)) < 0 || (dr = ckpt_flush_fd(fd)) < 0) {
++			/* The new file is in place and readable: not an error, but not durable */
++			e = errno;
++			snprintf(wmsg, wmsgl, "flushing directory '%s' failed (%s), the new file may not "
++			         "survive a power loss", dname, strerror(e));
++			if (fd >= 0)
++				close(fd);
++			*durab = CKPT_NODIRSYNC;
++			return 0;
++		}
++		close(fd);
++		if (fr > 0 || dr > 0) {
++			snprintf(wmsg, wmsgl, "F_FULLFSYNC not supported for the %s%s%s, only fsync() done: "
++			         "the drive cache may not be flushed", fr > 0 ? "file" : "",
++			         fr > 0 && dr > 0 ? " and the " : "", dr > 0 ? "directory" : "");
++			*durab = CKPT_REDUCED;
++		}
++	}
++#endif
++	return 0;
++}
++
++/* What save_ti3() needs, captured by main() when -K is given */
++static struct {
++	int enabled;
++	instType *atype;
++	int displ, trans;
++	xcalstd *ucalstd;
++	inst_opt_filter fe;
++	int dolab, npat, nchan;
++	chcol *cols;
++	int wpat;
++	char *outname;
++	cgats *ocg;
++} ckpt = { 0 };
++
++static void ckpt_save(void);
++
+ /* And save the current results */
++/* If checkpoint is nz, a write error is reported and the program continues. */
+ static void save_ti3(
+ 	instType atype,			/* Instrument used to read the chart */
+ 	int displ,				/* 1 = Use display emissive mode, 2 = display bright rel. */
+@@ -234,28 +409,30 @@
+ 	chcol *cols,			/* Internal storage of all the patch colors */
+ 	int wpat,				/* Set to index of white patch for display */
+ 	char *outname,			/* Output cgats file base name */
+-	cgats *ocg				/* output cgats structure */
++	cgats *ocg,				/* output cgats structure */
++	int checkpoint			/* nz if this is a -K checkpoint rather than the final save */
+ ) {
+ 	int i, j;
+ 	int nrpat;				/* Number of read patches */
++	int nwr = 0;			/* Number of patches written (padding excluded) */
+ 	int vpix = 0;			/* Valid patch index, if nrpatch > 0 */
+ 	int nsetel = 0;
+ 	double nn[3] = { 1.0, 1.0, 1.0 };
+ 	cgats_set_elem *setel;	/* Array of set value elements */
+ 
+ 	/* Note what instrument the chart was read with */
+-	ocg->add_kword(ocg, 0, "TARGET_INSTRUMENT", inst_name(atype) , NULL);
++	ckpt_set_kword(ocg, "TARGET_INSTRUMENT", inst_name(atype) );
+ 
+ 	/* X-Rite calibration standard (If reflective mode) */
+ 	if (displ == 0 && trans == 0 && ucalstd != xcalstd_none) 
+-		ocg->add_kword(ocg, 0, "DEVCALSTD",xcalstd2str(ucalstd), NULL);
++		ckpt_set_kword(ocg, "DEVCALSTD", xcalstd2str(ucalstd));
+ 
+ 	if (fe == inst_opt_filter_pol)
+-		ocg->add_kword(ocg, 0, "INSTRUMENT_FILTER", "POLARIZED", NULL);
++		ckpt_set_kword(ocg, "INSTRUMENT_FILTER", "POLARIZED");
+ 	else if (fe == inst_opt_filter_D65)
+-		ocg->add_kword(ocg, 0, "INSTRUMENT_FILTER", "D65", NULL);
++		ckpt_set_kword(ocg, "INSTRUMENT_FILTER", "D65");
+ 	else if (fe == inst_opt_filter_UVCut)
+-		ocg->add_kword(ocg, 0, "INSTRUMENT_FILTER", "UVCUT", NULL);
++		ckpt_set_kword(ocg, "INSTRUMENT_FILTER", "UVCUT");
+ 
+ 	/* Count patches actually read */
+ 	for (nrpat = i = 0; i < npat; i++) {
+@@ -273,7 +450,7 @@
+ 			error("Can't compute white Y relative display values without reading a white test patch");
+ 		}
+ 		sprintf(buf,"%f %f %f", cols[wpat].XYZ[0], cols[wpat].XYZ[1], cols[wpat].XYZ[2]);
+-		ocg->add_kword(ocg, 0, "LUMINANCE_XYZ_CDM2",buf, NULL);
++		ckpt_set_kword(ocg, "LUMINANCE_XYZ_CDM2", buf);
+ 
+ 		/* Normalise to white Y 100 */
+ 		if (displ == 2) {
+@@ -288,6 +465,10 @@
+ 		}
+ 	}
+ 
++	/* Overwrite any existing sets (freed, so that repeated saves don't leak, */
++	/* and before any field is added, since cgats refuses that on a non-empty table) */
++	ckpt_clear_sets(ocg);
++
+ 	nsetel += 1;		/* For id */
+ 	nsetel += 1;		/* For loc */
+ 	nsetel += nchan;	/* For device values */
+@@ -301,11 +482,11 @@
+ 
+ 		nsetel += cols[vpix].sp.spec_n;		/* Spectral values */
+ 		sprintf(buf,"%d", cols[vpix].sp.spec_n);
+-		ocg->add_kword(ocg, 0, "SPECTRAL_BANDS",buf, NULL);
++		ckpt_set_kword(ocg, "SPECTRAL_BANDS", buf);
+ 		sprintf(buf,"%f", cols[vpix].sp.spec_wl_short);
+-		ocg->add_kword(ocg, 0, "SPECTRAL_START_NM",buf, NULL);
++		ckpt_set_kword(ocg, "SPECTRAL_START_NM", buf);
+ 		sprintf(buf,"%f", cols[vpix].sp.spec_wl_long);
+-		ocg->add_kword(ocg, 0, "SPECTRAL_END_NM",buf, NULL);
++		ckpt_set_kword(ocg, "SPECTRAL_END_NM", buf);
+ 
+ 		/* Generate fields for spectral values */
+ 		for (i = 0; i < cols[vpix].sp.spec_n; i++) {
+@@ -316,16 +497,14 @@
+ 			            * (cols[vpix].sp.spec_wl_long - cols[vpix].sp.spec_wl_short) + 0.5);
+ 			
+ 			sprintf(buf,"SPEC_%03d",nm);
+-			ocg->add_field(ocg, 0, buf, r_t);
++			if (ocg->find_field(ocg, 0, buf) < 0)	/* (Already there after a checkpoint) */
++				ocg->add_field(ocg, 0, buf, r_t);
+ 		}
+ 	}
+ 
+ 	if ((setel = (cgats_set_elem *)malloc(sizeof(cgats_set_elem) * nsetel)) == NULL)
+ 		error("Malloc failed!");
+ 
+-	/* Overwrite any existing sets */
+-	ocg->t[0].nsets = 0;
+-
+ 	/* Write out the patch info to the output CGATS file */
+ 	for (i = 0; i < npat; i++) {
+ 		int k = 0;
+@@ -370,12 +549,43 @@
+ 		}
+ 
+ 		ocg->add_setarr(ocg, 0, setel);
++		nwr++;
+ 	}
+ 
+ 	free(setel);
+ 
+-	if (ocg->write_name(ocg, outname))
+-		error("Write error : %s",ocg->e.m);
++	if (ckpt.enabled) {
++		char emsg[MAXNAMEL+200], wmsg[2 * MAXNAMEL+200];
++		int durab;
++
++		if (ckpt_write_atomic(ocg, outname, emsg, sizeof(emsg), wmsg, sizeof(wmsg), &durab) != 0) {
++			if (!checkpoint)
++				error("Write error : %s",emsg);
++			printf("\n(Warning) Checkpoint not saved: %s\n"
++			       "The readings are kept in memory, the previous file is unchanged.\n",emsg);
++			return;
++		}
++		/* A reduced guarantee is reported on every save, never silently */
++		if (durab == CKPT_REDUCED)
++			printf("\n(Warning) Checkpoint durability reduced: %s\n",wmsg);
++		else if (durab == CKPT_NODIRSYNC)
++			printf("\n(Warning) Checkpoint not durable: %s\n",wmsg);
++		if (checkpoint)
++			printf("Checkpoint: %d patches saved to '%s'%s\n",nwr,outname,
++			       durab == CKPT_DURABLE ? "" : durab == CKPT_REDUCED ? " (reduced durability)"
++			                                                        : " (not durable)");
++	} else {
++		if (ocg->write_name(ocg, outname))
++			error("Write error : %s",ocg->e.m);
++	}
++}
++
++/* Rewrite the .ti3 with everything read so far (-K) */
++static void ckpt_save(void) {
++	if (!ckpt.enabled)
++		return;
++	save_ti3(*ckpt.atype, ckpt.displ, ckpt.trans, *ckpt.ucalstd, ckpt.fe, ckpt.dolab,
++	         ckpt.npat, ckpt.nchan, ckpt.cols, ckpt.wpat, ckpt.outname, ckpt.ocg, 1);
+ }
+ 
+ 
+@@ -1538,7 +1748,10 @@
+ 				/* Read a strip pass */
+ 				printf("\nReady to read strip pass %s%s\n",nn, done ? " (!! ALL ROWS READ !!)" : scols[oroi * stipa]->rr ? " (This row has been read)" : "" );
+ 				printf("Press 'f' to move forward, 'b' to move back, 'n' for next unread,\n");
+-				printf(" 'd' when done, Esc or 'q' to quit without saving.\n");
++				if (ckpt.enabled)
++					printf(" 'd' when done, Esc or 'q' to quit (passes read so far are saved).\n");
++				else
++					printf(" 'd' when done, Esc or 'q' to quit without saving.\n");
+ 				
+ 				if (uswitch == 1) {
+ 					printf("Trigger instrument switch to start reading.%s",fl_end);
+@@ -1949,6 +2162,7 @@
+ 				scb[i]->rr = 1;		/* Has been read */
+ 			}
+ 			incflag = 2;		/* Skip to next unread */
++			ckpt_save();		/* -K: make this strip pass durable before reading the next */
+ 
+ 
+ 		}		/* Go around to read another row */
+@@ -2499,6 +2713,7 @@
+ 	fprintf(stderr,"    p                  Polarising filter (M3)\n");
+ 	fprintf(stderr," -A N|A|X|G       XRGA conversion (default N)\n");
+ 	fprintf(stderr," -N               Disable initial calibration of instrument if possible\n");
++	fprintf(stderr," -K               Save the .ti3 after each strip pass (resume with -r)\n");
+ 	fprintf(stderr," -B               Disable auto bi-directional strip recognition\n");
+ 	fprintf(stderr," -b               Force auto bi-directional strip recognition\n");
+ 	fprintf(stderr," -H               Use high resolution spectrum mode (if available)\n");
+@@ -2632,6 +2847,10 @@
+ 			} else if (argv[fa][1] == 'N')
+ 				nocal = 1;
+ 
++			/* Checkpoint the .ti3 after each strip pass */
++			else if (argv[fa][1] == 'K')
++				ckpt.enabled = 1;
++
+ 			/* Disable bi-directional strip recognition */
+ 			else if (argv[fa][1] == 'B')
+ 				disbidi = 1;
+@@ -3367,6 +3586,22 @@
+ 			error("No instrument at port %d",comport);
+ 	}
+ 
++	/* -K: what save_ti3() needs from here, for the checkpoints in read_strips() */
++	if (ckpt.enabled) {
++		ckpt.atype = &atype;
++		ckpt.displ = displ;
++		ckpt.trans = trans;
++		ckpt.ucalstd = &ucalstd;
++		ckpt.fe = fe;
++		ckpt.dolab = dolab;
++		ckpt.npat = npat;
++		ckpt.nchan = nchan;
++		ckpt.cols = cols;
++		ckpt.wpat = wpat;
++		ckpt.outname = outname;
++		ckpt.ocg = ocg;
++	}
++
+ 	/* Read all of the strips in */
+ 	if (read_strips(itype, scols, &atype, npat, totpa, stipa, pis, paix,
+ 	                saix, ixord, rstart, rand, hex, ipath, fc, plen, glen, tlen,
+@@ -3377,7 +3612,7 @@
+ 		            g_log) == 0) {
+ 
+ 		/* And save the result */
+-		save_ti3(atype, displ, trans, ucalstd, fe, dolab, npat, nchan, cols, wpat, outname, ocg);
++		save_ti3(atype, displ, trans, ucalstd, fe, dolab, npat, nchan, cols, wpat, outname, ocg, 0);
+ 	}
+ 
+ 	free(scols);

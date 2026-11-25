@@ -1,0 +1,38 @@
+# chartread-fgK as a Flatpak module (USB instruments only), installed in /app/chartread-fgK/,
+# where freeglaz looks for its shipped engine inside the sandbox
+# (lib/z9_client/chartread_fgk/engine.py, FLATPAK_DIR).
+#
+# Copyright 2026 the freeglaz contributors. SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The bytes installed are the bytes built: no debug split, no strip (flatpak-builder would
+# otherwise rewrite the binary after make_manifest.py hashed it). The sha256 depends on the
+# SDK's compiler: it is the one to pin in freeglaz's TRUSTED_BUILDS for a release built with
+# THIS SDK commit, and it changes when the SDK's GCC or binutils change.
+#
+# freeglaz's manifest carries the same commands with this repository as a git source at a
+# fixed commit; this file builds the working tree (type: dir), for local checks.
+#
+# The app that includes this module needs, for the instrument (see freeglaz's manifest):
+#   --device=usb                          (Flatpak >= 1.15.11; narrower than --device=all)
+#   --filesystem=xdg-run/freeglaz:create  (per-user lock shared with a native freeglaz)
+# and, on the host, udev rules giving the user access to the instrument.
+name: chartread-fgK
+buildsystem: simple
+build-options:
+  no-debuginfo: true
+  strip: false
+build-commands:
+  - build/build-chartread-fgK.sh --zip upstream/Argyll_V3.5.0_src.zip
+      --patch patches/fg-chartread-checkpoint.v3.1.patch --out _out
+  - install -Dm755 _out/chartread-fgK /app/chartread-fgK/chartread-fgK
+  - python3 tools/make_manifest.py /app/chartread-fgK/chartread-fgK
+      --patch patches/fg-chartread-checkpoint.v3.1.patch --platform linux
+      --arch "$(uname -m | sed s/aarch64/arm64/)" --usb-only
+      --source-zip upstream/Argyll_V3.5.0_src.zip
+      --toolchain "$(cc --version | head -1); $(ld -v | head -1)"
+  # Corresponding Source (AGPL-3.0 section 6), next to the binary
+  - tools/make-source-tarball.sh upstream/Argyll_V3.5.0_src.zip /app/chartread-fgK/source
+  - install -Dm644 README.md NOTICE.md COPYING -t /app/chartread-fgK/source/
+sources:
+  - type: dir
+    path: ../..       # this repository
